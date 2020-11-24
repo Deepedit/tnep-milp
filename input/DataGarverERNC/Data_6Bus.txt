@@ -1,0 +1,170 @@
+!Existing lines
+L_F:[]
+
+!Non-existing lines candidate for being built
+L_C:[4 5 6 7 8 9 10 11]
+
+!Existing lines candidate for receiving phase-shifter
+L_PS:[2 3]
+
+!Existing lines candidate for receiving series compensation
+L_SC:[1]
+
+!Maximum phase-shitifing of the candidate phase-shifters
+psi_max: [0.7854 0.7854]
+
+!Maximum change in the flow by the series compensators.
+F_sc_max: [3.0]
+
+!Maximum change in the reactance by the series compensators.
+x_c_max: [0.3]
+
+!Minimum change in the reactance by the series compensators.
+x_c_min: [0.0]
+
+!Origin bus of both candidate and existing lines.
+de:[1
+3
+3
+1
+1
+1
+5
+1
+6
+3
+3]
+
+!Destination bus of both candidate and existing lines.
+para:[3
+4
+2
+4
+2
+5
+2
+6
+4
+4
+2]
+		
+!Reactances of both candidate and existing lines.
+x: [0.7
+0.7
+0.7
+1.0
+1.0
+1.0
+1.0
+1.0
+1.0
+0.7
+0.7] 
+
+
+!Maximum capacity of the lines(Althoug this vector has indexes for all possible lines, only the indexes belonging to L_F, L_PS, and L_SC are acessed, others are therefore zero here)
+F_max: [1.0
+0.4
+0.6
+0.0
+0.0
+0.0
+0.0
+0.0
+0.0
+0.0
+0.0]
+
+!Maximun capacity for candidate transmission lines(those belonging to L_C) 
+F_cand_max:[0.5
+0.9
+1.0
+1.0
+0.4
+0.4
+0.4
+0.6]
+
+!Hourly(multiply per 8760 to get annual cost) Variable costs for transmission assets(only lines belonging to L_C)
+C_cap:[10.0 
+10.0
+6.0
+6.0
+6.0
+6.0
+7.0
+7.0]
+
+!Hourly(multiply per 8760 to get annual cost) Fixed costs for transmission assets(lines and flexible devices)
+C_l:[40 
+40
+40 
+100 
+100
+60
+60
+60
+60
+70
+70]
+
+!Indexes of conventional and already existing generators
+I_C:[1 2 3 4]
+
+!Indexes of potential wind generators
+I_W:[5 6]
+
+!Not using this data for fixed cost of generators since there are no commitment variables here
+Custo_fix:[100000
+100000
+560000
+]
+
+!Generation variable cost
+C_p: [1000
+1000
+9600
+9600
+]
+
+!Up-spinning reserve cost
+C_u: [300
+300
+9000
+9000]
+
+!Down-spinning reserve cost
+C_d: [200
+200
+9000
+9000]
+
+!Generation limits
+P_max:[2.0
+2.0
+1.4
+1.4]
+
+P_min:[0.0
+0.0
+0.0
+0.0]
+
+!Reserve limits
+RU_max:[1.0
+1.0
+0.7
+0.7]
+
+RD_max:[1.0
+1.0
+0.7
+0.7]
+
+!Number of hours of each snapshot
+Duration:[2920
+2920
+2920]
+
+!Conjunto de indices. Entre parenteses estão as barras. entre colchetes os geradores da barra entre parenteses à esquerda.
+I_b: [(1) [1 2] (2) [4] (3) [ ] (4) [3] (5) [5] (6) [6]] !lista dos geradores de cada barra

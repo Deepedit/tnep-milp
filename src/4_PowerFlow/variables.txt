@@ -1,0 +1,19 @@
+this.VarDecision	: vector con U y ángulos
+			  dimensión: 2xnr.buses --> U, Theta
+			  en IAEW: zust_polar
+			  en IAEW: zust_kart --> contiene parte real y parte imaginaria de U*ejTheta
+
+s_nom			: potencia aparente de inyección al sistema (conocido)
+			  dimensión: 2xnr.buses --> P, Q
+
+delta_s			: función objetivo --> calculada del balance de ecuaciones y la inyección de generadores menos los consumos. Tiende a ser cero
+			  dimensión: 2xnr.buses --> P, Q
+
+s			: potencia aparente como resultado del balance de ecuaciones
+			  dimensión: 2xnr.buses --> P, Q
+
+
+
+xi+1 = xi - inv(Ji)*f(xi)
+
+this.Vardecisioni+1 = this.Vardecisioni - inv(Ji)*(si-snomi) con s-snom = delta_s

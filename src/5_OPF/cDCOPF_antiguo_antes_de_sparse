@@ -1,0 +1,1806 @@
+classdef cDCOPF < cOPF
+    properties
+		pSEP = cSistemaElectricoPotencia.empty
+        pSM = cmSistemaModal.empty
+        %pAdmOper = cAdministradorEscenariosOperacion.empty
+		pResEvaluacion = cResultadoEvaluacionSEP.empty
+        pParOpt = cParOptimizacionOPF.empty
+        pAdmSc = cAdministradorEscenarios.empty
+        Sbase = 0;
+        
+        DatosEscenarioLocal = false
+        CapacidadGeneradores = []
+        SerieGeneradoresERNC = []
+        SerieConsumos = []
+        Nro_etapa_datos_escenario = 0
+        
+        VariablesInicializadas = false
+        
+        % resultados problema de optimizacion
+        ResOptimizacion
+        ExitFlag
+        DescripcionFlag
+        Fval
+        Output
+        Lambda
+        
+        % vectores con punteros a elementos de red que corresponden a las
+        % variables de operación
+        VarOpt= cmElementoModal.empty;
+        TipoVarOpt = cell.empty;
+        UnidadesVarOpt = cell.empty;
+        iCantPuntosOperacion = 0;
+        
+        % vector que contiene los puntos de operación
+        % si no se ingresa en forma externa
+        vPuntosOperacion = 1  
+        
+        % Parámetro de ACO. Indica la etapa correspondiente. TODO: Hay que eliminar esta variables. 
+        % Por ahora se necesita para cargar los límites de la etapa
+        % correspondiente. Estas se tienen que manejar directamente en el SEP
+        iEtapa = 0
+        
+		Fobj  = [] %funcion objetivo
+        Aeq = []  % matriz con restricciones de igualdad
+        beq = []  % vector objetivo restricciones de igualdad
+        Aineq = [] % matriz con restricciones de desigualdad
+        bineq = []  % vector de desigualdades
+        lb = [] %valores mínimos de variables de decisión
+        ub = [] %valores máximos de variables de decisión
+
+        InsertaResultadosEnSEP = true;
+        
+        % Sólo en modo debug
+        NombreVariables = []
+        NombreIneq = []
+        NombreEq = []
+        
+        MuestraDetalleIteraciones = false
+        
+        iIndiceIneq = 0
+        iIndiceEq = 0
+        iNivelDebug = 2
+        caso_estudio = 'caso_base'
+        nombre_archivo = './output/dc_opf.dat'
+        nombre_archivo_problema_opt = './output/dc_opf_problem_formulation.dat'
+        nombre_archivo_detalle_variables = './output/variables_dc_opf.dat'
+    end
+    
+    methods
+	
+		function this = cDCOPF(sep, varargin)                
+			this.pSEP = sep;
+            this.pParOpt = cParOptimizacionOPF();
+            this.pResEvaluacion = cResultadoEvaluacionSEP(sep);
+            this.pResEvaluacion.inserta_tipo_flujo_potencia('DC');
+            this.pResEvaluacion.inserta_tipo_computo('OPF');
+            this.pResEvaluacion.inserta_tipo_problema(this.pParOpt.entrega_tipo_problema());
+            this.pSM = cmSistemaModal(sep, 1);
+            sep.inserta_sistema_modal(this.pSM);
+            this.pSM.inserta_opf(this);
+            
+            if nargin > 2
+                %OPF para planificación
+                this.pAdmSc = varargin{1};
+                this.vPuntosOperacion = this.pAdmSc.entrega_puntos_operacion();
+                this.iCantPuntosOperacion = length(this.vPuntosOperacion);
+                % reemplaza parámetros del OPF por los indicados en ACO
+                this.copia_parametros_optimizacion(varargin{2})
+                this.DatosEscenarioLocal = false;
+            else
+                this.DatosEscenarioLocal = true;
+            end
+        end
+        
+        function inserta_caso_estudio(this, caso_estudio)
+            this.caso_estudio = caso_estudio;
+        end
+        
+        function inserta_etapa(this, nro_etapa)
+            % etapa se utiliza para ACO
+            this.iEtapa = nro_etapa;
+        end
+        
+        function etapa = entrega_etapa(this)
+            etapa = this.iEtapa;
+        end
+        
+        function inserta_etapa_datos_escenario(this, nro_etapa)
+            this.Nro_etapa_datos_escenario = nro_etapa;
+            this.iEtapa = nro_etapa;
+        end
+        
+        function etapa = entrega_etapa_datos_escenario(this)
+            etapa = this.Nro_etapa_datos_escenario;
+        end
+        
+        function inserta_sbase(this, val)
+            this.Sbase = val;
+        end
+        
+        function actualiza_etapa(this, nro_etapa)
+            this.iEtapa = nro_etapa;
+            for oper = 1:length(this.vPuntosOperacion)
+                %actualiza potencias de los generadores y consumos (ens) de acuerdo a
+                %la etapa
+                for i = 1:length(this.VarOpt)
+                    elred = this.VarOpt(i).entrega_elemento_red();
+                    switch this.TipoVarOpt{i}
+                        case 'VariableControl'
+                            % Potencia de inyección del generador
+                            if this.DatosEscenarioLocal
+                                id_generador_sc = this.VarOpt(i).entrega_elemento_red().entrega_indice_escenario();
+                                pmax = this.CapacidadGeneradores(id_generador_sc);
+                                pmax = pmax/this.Sbase;
+                            elseif ~isempty(this.pAdmSc)
+                                % factor de expansión para TNEP
+                                id_generador_sc = this.VarOpt(i).entrega_elemento_red().entrega_indice_escenario();
+                                pmax = this.pAdmSc.entrega_capacidad_generador(id_generador_sc, this.iEtapa);
+                                sbase = cParametrosSistemaElectricoPotencia.getInstance.entrega_sbase();
+                                pmax = pmax/sbase;
+                            else
+                                pmax = elred.entrega_pmax_pu();                                
+                            end
+                            pmin = elred.entrega_pmin_pu();
+
+                            if strcmp(this.pParOpt.entrega_tipo_problema(), 'Redespacho')
+                            	% problema de redespacho. se
+                                % consideran los delta de los
+                                % límites
+                                if elred.es_despachable()
+                                    p0 = elred.entrega_p0_pu();
+                                    pmax = pmax - p0;
+                                    pmin = p0 - pmin;
+                                end
+                            end
+                            indice_varopt_operacion = this.VarOpt(i).entrega_varopt_operacion('P', oper);
+                            this.lb(indice_varopt_operacion) = round(pmin,5);
+                            this.ub(indice_varopt_operacion) = round(pmax,5);
+                            %if this.iNivelDebug > 1
+                            %    this.ingresa_nombres(indice, oper, this.TipoVarOpt{i}, this.UnidadesVarOpt{i});
+                            %end
+                        case 'VariableEstado'
+                            % nada que hacer, ya que ángulo de las
+                            % subestaciones ya fueron definidos
+                        case 'VariableAuxiliar'
+                            switch this.UnidadesVarOpt{i}
+                                case 'P'
+                                    % potencia activa de líneas y
+                                    % transformadores o energia no
+                                    % suministrada o recorte res
+                                    if isa(elred, 'cLinea') || isa(elred, 'cTransformador2D')
+                                        % nada que hacer, ya que límites ya
+                                        % fueron definidos
+                                    elseif isa(elred, 'cConsumo')
+                                        %actualiza condumos
+                                        indice_varopt_operacion = this.VarOpt(i).entrega_varopt_operacion('P', oper);
+                                        if this.DatosEscenarioLocal
+                                            id_consumo_sc = elred.entrega_indice_escenario();
+                                            consumo_max = this.SerieConsumos(id_consumo_sc, oper);
+                                            consumo_max = consumo_max/this.Sbase;
+                                        elseif ~isempty(this.pAdmSc)
+                                            % factor de expansión para TNEP
+                                            id_consumo_sc = elred.entrega_indice_escenario();
+                                            consumo_max = this.pAdmSc.entrega_consumo_pu(id_consumo_sc, this.iEtapa, oper);
+                                        else
+                                            consumo_max = -elred.entrega_p_const_nom_pu(); %valor positivo
+                                        end
+                                        %this.lb(indice) = 0;
+                                        this.ub(indice_varopt_operacion) = round(consumo_max,5);
+                                    elseif isa(elred, 'cGenerador')
+                                        indice_varopt_operacion = this.VarOpt(i).entrega_varopt_operacion('P', oper);
+                                        if this.DatosEscenarioLocal
+                                            id_generador_sc = this.VarOpt(i).entrega_elemento_red().entrega_indice_escenario();
+                                            pmax = this.SerieGeneradoresERNC(id_generador_sc, oper);
+                                            pmax = pmax/this.Sbase;
+                                        elseif ~isempty(this.pAdmSc)
+                                            % factor de expansión para TNEP
+                                            id_generador_sc = this.VarOpt(i).entrega_elemento_red().entrega_indice_escenario();
+                                            pmax = this.pAdmSc.entrega_inyeccion(id_generador_sc, this.iEtapa, oper);
+                                            sbase = cParametrosSistemaElectricoPotencia.getInstance.entrega_sbase();
+                                            pmax = pmax/sbase;
+                                        else
+                                            pmax = elred.entrega_pmax_pu();                                
+                                        end
+                                        this.ub(indice_varopt_operacion) = round(pmax,5);
+                                    else
+                                        error = MException('cOPF:actualiza_etapa',...
+                                            ['Inconsistencia en los datos en variable auxiliar P. Elemento de red ' class(elred) ' no corresponde']);
+                                        throw(error)
+                                    end
+                                otherwise
+                                    error = MException('cOPF:actualiza_etapa',...
+                                        ['Inconsistencia en los datos en variable auxiliar. Tipo ' this.UnidadesVarOpt{i} ' no corresponde']);
+                                    throw(error)
+                            end
+                        otherwise
+                            error = MException('cOPF:actualiza_etapa',...
+                                ['Inconsistencia en los datos. Tipo de variable de control ' this.TipoVarOpt{i} ' no corresponde']);
+                            throw(error)
+                    end
+                end
+                
+                %actualiza balance de energía
+                pBuses = this.pSM.entrega_buses();
+                for i = 1:length(pBuses)
+                    id_restriccion_be = pBuses(i).entrega_indice_restriccion_balance_energia(oper);
+
+                    %consumo residual
+                    if this.DatosEscenarioLocal
+                        consumo_residual_p = 0;
+                        elpar = pBuses(i).entrega_elementos_paralelos();
+                        for ii = 1:length(elpar)
+                            valor_elemento = 0;
+                            el_red = elpar(ii).entrega_elemento_red();
+                            if isa(el_red, 'cConsumo')
+                                indice = el_red.entrega_indice_escenario();
+                                valor_elemento = -this.SerieConsumos(indice, oper)/this.Sbase;
+                            elseif isa(el_red, 'cGenerador')
+                                if el_red.es_ernc()
+                                    indice = el_red.entrega_indice_escenario();
+                                    valor_elemento = this.SerieGeneradoresERNC(indice, oper)/this.Sbase;
+                                end
+                            end
+                            consumo_residual_p = consumo_residual_p + valor_elemento;
+                        end
+                    elseif ~isempty(this.pAdmSc)
+                        consumo_residual_p = pBuses(i).entrega_p_const_nom_opf(this.iEtapa, oper);
+                    else
+                        consumo_residual_p = pBuses(i).entrega_p_const_nom_opf();
+                    end
+                    this.beq(id_restriccion_be) = round(-consumo_residual_p,5);
+                end
+            end            
+        end
+        
+        function inserta_puntos_operacion(this, po)
+            this.vPuntosOperacion = po;
+            this.iCantPuntosOperacion = length(this.vPuntosOperacion);
+        end
+        
+        function inserta_datos_escenario(this, datos_escenario)
+            this.CapacidadGeneradores = datos_escenario.CapacidadGeneradores;
+            this.SerieGeneradoresERNC = datos_escenario.SerieGeneradoresERNC;
+            this.SerieConsumos = datos_escenario.SerieConsumos;
+        end
+        
+        function inserta_nivel_debug(this, nivel)
+            this.iNivelDebug = nivel;
+        end
+        
+        function nivel = entrega_nivel_debug(this)
+            nivel = this.iNivelDebug;
+        end
+        
+        function inserta_resultados_en_sep(this, val)
+            this.InsertaResultadosEnSEP = val;
+        end
+        
+		function calcula_despacho_economico(this)
+            if this.VariablesInicializadas == false
+                this.iIndiceIneq = 0;
+                this.iIndiceEq = 0;
+                this.inicializa_variables();
+                this.inicializa_contenedores();
+			
+                this.escribe_funcion_objetivo();
+                this.escribe_restricciones();
+                this.VariablesInicializadas = true;
+            end
+            if this.iNivelDebug > 1
+                this.imprime_problema_optimizacion();
+            end
+            
+			this.optimiza();
+            this.pResEvaluacion.inicializa_contenedores(length(this.vPuntosOperacion));
+            if this.ExitFlag == 1
+                % problema tiene solucion óptima
+                this.pResEvaluacion.ExisteResultado = true;
+                this.escribe_resultados();
+                if this.iNivelDebug > 0
+                    this.imprime_resultados_protocolo();
+                end
+            else
+                this.pResEvaluacion.ExisteResultado = false;
+                if this.iNivelDebug > 0
+                    prot = cProtocolo.getInstance;
+                    prot.imprime_texto('Problema de optimizacion invalido');
+                    prot.imprime_texto(['Estado flag: ' num2str(this.ExitFlag)]);
+                end
+                % problema no tiene solucion
+                % no se escriben resultados porque no tiene sentido
+            end
+        end
+
+		function calcula_despacho_economico_sin_restricciones_red(this)
+            if this.VariablesInicializadas == false
+                this.iIndiceIneq = 0;
+                this.iIndiceEq = 0;
+                this.inicializa_variables();
+                this.inicializa_contenedores();
+			
+                this.escribe_funcion_objetivo();
+                this.escribe_restricciones();
+                this.VariablesInicializadas = true;
+            end
+            
+            % desactiva las restricciones de red
+            this.desactiva_restricciones_red();
+            
+            if this.iNivelDebug > 1
+                this.imprime_problema_optimizacion();
+            end
+            
+			this.optimiza();
+            this.pResEvaluacion.inicializa_contenedores(length(this.vPuntosOperacion));
+            if this.ExitFlag == 1
+                % problema tiene solucion óptima
+                this.pResEvaluacion.ExisteResultado = true;
+                this.escribe_resultados();
+                if this.iNivelDebug > 0
+                    this.imprime_resultados_protocolo();
+                end
+            else
+                this.pResEvaluacion.ExisteResultado = false;
+                if this.iNivelDebug > 0
+                    prot = cProtocolo.getInstance;
+                    prot.imprime_texto('Problema de optimizacion invalido');
+                    prot.imprime_texto(['Estado flag: ' num2str(this.ExitFlag)]);
+                end
+                % problema no tiene solucion
+                % no se escriben resultados porque no tiene sentido
+                
+            end
+            
+            this.activa_restricciones_red();
+        end
+        
+        function desactiva_restricciones_red(this)
+            for oper = 1:length(this.vPuntosOperacion)
+                for i = 1:length(this.VarOpt)
+                    switch this.TipoVarOpt{i}
+                        case 'VariableControl'
+                            % nada
+                        case 'VariableEstado'
+                            % ángulo de las subestaciones 
+                            indice = this.VarOpt(i).entrega_varopt_operacion('Theta',oper);
+                            if this.VarOpt(i).es_slack()
+                                this.lb(indice) = 0;
+                                this.ub(indice) = 0;
+                            else
+                                this.lb(indice) = round(-2*pi,5);
+                                this.ub(indice) = round(2*pi,5);
+                            end
+                        case 'VariableAuxiliar'
+                            switch this.UnidadesVarOpt{i}
+                                case 'P'
+                                    % potencia activa de líneas y
+                                    % transformadores o energia no
+                                    % suministrada
+                                    indice = this.VarOpt(i).entrega_varopt_operacion('P', oper);
+                                    elred = this.VarOpt(i).entrega_elemento_red(); 
+                                    if isa(elred, 'cLinea') || isa(elred, 'cTransformador2D')
+                                        sr = elred.entrega_sr_pu();
+                                        this.lb(indice) = -10*sr;
+                                        this.ub(indice) = 10*sr;
+                                    end
+                                otherwise
+                                    error = MException('cOPF:inicializa_variables',...
+                                        ['Inconsistencia en los datos en variable auxiliar. Tipo ' this.UnidadesVarOpt{i} ' no corresponde']);
+                                    throw(error)
+                            end
+                        otherwise
+                            error = MException('cOPF:inicializa_variables',...
+                                ['Inconsistencia en los datos. Tipo de variable de control ' this.TipoVarOpt{i} ' no corresponde']);
+                            throw(error)
+                    end
+                end
+            end
+        end
+        
+        function activa_restricciones_red(this)
+            for oper = 1:length(this.vPuntosOperacion)
+                for i = 1:length(this.VarOpt)             
+                    switch this.TipoVarOpt{i}
+                        case 'VariableControl'
+                            % nada
+                        case 'VariableEstado'
+                            % ángulo de las subestaciones
+                            indice = this.VarOpt(i).entrega_varopt_operacion('Theta',oper);
+                            if this.VarOpt(i).es_slack()
+                                this.lb(indice) = 0;
+                                this.ub(indice) = 0;
+                            else
+                                this.lb(indice) = round(-pi,5);
+                                this.ub(indice) = round(pi,5);
+                            end
+                        case 'VariableAuxiliar'
+                            switch this.UnidadesVarOpt{i}
+                                case 'P'
+                                    % potencia activa de líneas y
+                                    % transformadores o energia no
+                                    % suministrada                                    
+                                    indice = this.VarOpt(i).entrega_varopt_operacion('P', oper);
+                                    elred = this.VarOpt(i).entrega_elemento_red(); 
+                                    if isa(elred, 'cLinea') || isa(elred, 'cTransformador2D')
+                                        sr = elred.entrega_sr_pu();
+                                        this.lb(indice) = -sr;
+                                        this.ub(indice) = sr;
+                                    end
+                                otherwise
+                                    error = MException('cOPF:activa_restricciones_red',...
+                                        ['Inconsistencia en los datos en variable auxiliar. Tipo ' this.UnidadesVarOpt{i} ' no corresponde']);
+                                    throw(error)
+                            end
+                        otherwise
+                            error = MException('cOPF:activa_restricciones_red',...
+                                ['Inconsistencia en los datos. Tipo de variable de control ' this.TipoVarOpt{i} ' no corresponde']);
+                            throw(error)
+                    end
+                end
+            end            
+        end        
+        
+        function formula_problema_despacho_economico(this)
+            this.iIndiceIneq = 0;
+            this.iIndiceEq = 0;
+            this.inicializa_variables();
+            this.inicializa_contenedores();
+			
+            this.escribe_funcion_objetivo();
+            this.escribe_restricciones();
+            this.VariablesInicializadas = true;
+        end
+        
+        function inicializa_variables(this)
+            % Primero crea las variables de optimización y luego las
+            % inicializa
+            
+            % variables de control (cuando flag opf esté activada): 
+            % 1. potencia activa (despacho) de los generadores. También se
+            % consideran los generadores RES en caso de que flag opf esté
+            % activada
+            % 
+            % Variables de estado:
+            % 2. Ángulos de los buses (la Slack se fija en cero pero se incluye como variable)
+            %
+            % Variables auxiliares (ayudan a la formulación del problema)
+            % 2. Flujos por las líneas y transformadores.
+            % 3. Consumos (para energía no suministrada)
+            
+            % variables de control.
+            this.inserta_varopt(this.pSM.entrega_generadores_despachables(), 'VariableControl', 'P');
+                
+            % variables de estado
+            this.inserta_varopt(this.pSM.entrega_buses(), 'VariableEstado', 'Theta');
+            
+            % variables auxiliares.
+            mlineas = this.pSM.entrega_elemento_serie('cLinea');
+            this.inserta_varopt(mlineas, 'VariableAuxiliar', 'P');
+            
+            mtrafo2d = this.pSM.entrega_elemento_serie('cTransformador2D');
+            this.inserta_varopt(mtrafo2d, 'VariableAuxiliar', 'P')
+
+            if this.pParOpt.considera_desprendimiento_carga()
+                mconsumo = this.pSM.entrega_elemento_paralelo('cConsumo');
+                this.inserta_varopt(mconsumo, 'VariableAuxiliar', 'P');
+            end
+
+            if this.pParOpt.ConsideraRecorteRES
+                this.inserta_varopt(this.pSM.entrega_generadores_ernc(), 'VariableAuxiliar', 'P');
+            end
+            
+            % Inicializa las variables
+            if this.iNivelDebug > 1
+                this.NombreVariables = cell(length(this.VarOpt)*length(this.vPuntosOperacion),1);
+            end
+            indice = 0;
+            for oper = 1:length(this.vPuntosOperacion)
+                for i = 1:length(this.VarOpt)
+                    indice = indice + 1;
+                    elred = this.VarOpt(i).entrega_elemento_red();
+                    switch this.TipoVarOpt{i}
+                        case 'VariableControl'
+                            % Potencia de inyección de generador
+                            % despachable
+                            %elred.inserta_flag_opf(true);
+                            if this.DatosEscenarioLocal
+                                id_generador_sc = this.VarOpt(i).entrega_elemento_red().entrega_indice_escenario();
+                                pmax = this.CapacidadGeneradores(id_generador_sc);
+                                pmax = pmax/this.Sbase;
+                            elseif ~isempty(this.pAdmSc)
+                                % factor de expansión para TNEP
+                                id_generador_sc = this.VarOpt(i).entrega_elemento_red().entrega_indice_escenario();
+                                pmax = this.pAdmSc.entrega_capacidad_generador(id_generador_sc, this.iEtapa);
+                                sbase = cParametrosSistemaElectricoPotencia.getInstance.entrega_sbase();
+                                pmax = pmax/sbase;
+                            else
+                                pmax = elred.entrega_pmax_pu();                                
+                            end
+                            pmin = elred.entrega_pmin_pu();
+
+                            if strcmp(this.pParOpt.entrega_tipo_problema(), 'Redespacho')
+                            	% problema de redespacho. se
+                                % consideran los delta de los
+                                % límites
+                                if elred.es_despachable()
+                                    p0 = elred.entrega_p0_pu();
+                                    pmax = pmax - p0;
+                                    pmin = p0 - pmin;
+                                end
+                            end
+                            this.VarOpt(i).inserta_varopt_operacion('P', oper, indice);
+                            this.lb(indice) = round(pmin,5);
+                            this.ub(indice) = round(pmax,5);
+                            if this.iNivelDebug > 0                                
+                                this.ingresa_nombres(i, indice, oper, this.TipoVarOpt{i}, this.UnidadesVarOpt{i});
+                            end
+                        case 'VariableEstado'
+                            % ángulo de las subestaciones 
+                            this.VarOpt(i).inserta_varopt_operacion('Theta', oper, indice);
+                            if this.VarOpt(i).es_slack()
+                                this.lb(indice) = 0;
+                                this.ub(indice) = 0;
+                            else
+                                this.lb(indice) = round(-pi,5);
+                                this.ub(indice) = round(pi,5);
+                            end
+                            if this.iNivelDebug > 0
+                                this.ingresa_nombres(i, indice, oper, this.TipoVarOpt{i}, this.UnidadesVarOpt{i});
+                            end
+                        case 'VariableAuxiliar'
+                            switch this.UnidadesVarOpt{i}
+                                case 'P'
+                                    % potencia activa de líneas y
+                                    % transformadores o energia no
+                                    % suministrada
+                                    this.VarOpt(i).inserta_varopt_operacion('P', oper, indice);
+                                    elred = this.VarOpt(i).entrega_elemento_red(); 
+                                    if isa(elred, 'cLinea') || isa(elred, 'cTransformador2D')
+                                        sr = elred.entrega_sr_pu();
+                                        this.lb(indice) = -sr;
+                                        this.ub(indice) = sr;
+                                    elseif isa(elred, 'cConsumo')
+                                        if this.DatosEscenarioLocal
+                                            id_consumo_sc = elred.entrega_indice_escenario();
+                                            consumo_max = this.SerieConsumos(id_consumo_sc, oper);
+                                            consumo_max = consumo_max/this.Sbase;
+                                        elseif ~isempty(this.pAdmSc)
+                                            % factor de expansión para TNEP
+                                            id_consumo_sc = elred.entrega_indice_escenario();
+                                            consumo_max = this.pAdmSc.entrega_consumo_pu(id_consumo_sc, this.iEtapa, oper);
+                                        else
+                                            consumo_max = -elred.entrega_p_const_nom_pu(); %valor positivo
+                                        end
+                                        this.lb(indice) = 0;
+                                        this.ub(indice) = round(consumo_max,5);
+                                    elseif isa(elred, 'cGenerador')                                        
+                                        if this.DatosEscenarioLocal
+                                            id_generador_sc = this.VarOpt(i).entrega_elemento_red().entrega_indice_escenario();
+                                            pmax = this.SerieGeneradoresERNC(id_generador_sc, oper);
+                                            pmax = pmax/this.Sbase;
+                                        elseif ~isempty(this.pAdmSc)
+                                            % factor de expansión para TNEP
+                                            id_generador_sc = this.VarOpt(i).entrega_elemento_red().entrega_indice_escenario();
+                                            pmax = this.pAdmSc.entrega_inyeccion(id_generador_sc, this.iEtapa, oper);
+                                            sbase = cParametrosSistemaElectricoPotencia.getInstance.entrega_sbase();
+                                            pmax = pmax/sbase;
+                                        else
+                                            pmax = elred.entrega_pmax_pu();                                
+                                        end
+                                        this.lb(indice) = 0;
+                                        this.ub(indice) = round(pmax,5);                                        
+                                    else
+                                        error = MException('cOPF:inicializa_variables',...
+                                            ['Inconsistencia en los datos en variable auxiliar P. Elemento de red ' class(elred) ' no corresponde']);
+                                        throw(error)
+                                    end
+                                    if this.iNivelDebug > 0
+                                        this.ingresa_nombres(i, indice, oper, this.TipoVarOpt{i}, this.UnidadesVarOpt{i});
+                                    end
+                                otherwise
+                                    error = MException('cOPF:inicializa_variables',...
+                                        ['Inconsistencia en los datos en variable auxiliar. Tipo ' this.UnidadesVarOpt{i} ' no corresponde']);
+                                    throw(error)
+                            end
+                        otherwise
+                            error = MException('cOPF:inicializa_variables',...
+                                ['Inconsistencia en los datos. Tipo de variable de control ' this.TipoVarOpt{i} ' no corresponde']);
+                            throw(error)
+                    end
+                end
+            end
+        end
+
+        function agrega_variable(this, variable)
+            % variable es elemento del sistema modal
+            % Esta función es peligrosa. Fue definida sólo para
+            % TNEP para mejorar performance!
+            
+            indice = length(this.Fobj);
+            % agrega nueva variable a función objetivo. Como sólo se
+            % trata de nuevas líneas y transformadores, estos no afectan a
+            % la función objetivo
+            this.Fobj = [this.Fobj; zeros(length(this.vPuntosOperacion), 1)];
+
+            % actualiza dimensión de restricciones de igualdad
+            this.Aeq = [this.Aeq zeros(this.iIndiceEq, length(this.vPuntosOperacion))];
+            
+            if isa(variable, 'cmBus')
+                this.agrega_varopt(variable, 'VariableEstado', 'Theta');
+                for oper = 1:length(this.vPuntosOperacion)
+                    indice = indice + 1;
+                    variable.inserta_varopt_operacion('Theta', oper, indice);
+                    this.lb(indice) = round(-pi,5);
+                    this.ub(indice) = round(pi,5);
+                    if this.iNivelDebug > 0
+                    	this.ingresa_nombres(length(this.VarOpt), indice, oper, 'VariableEstado', 'Theta');
+                    end
+                    
+                    % agrega nueva restricción para balance de energía
+                    this.agrega_balance_energia(variable, oper);
+                end
+            elseif isa(variable, 'cmElementoSerie')
+                this.agrega_varopt(variable, 'VariableAuxiliar', 'P');
+                for oper = 1:length(this.vPuntosOperacion)
+                    indice = indice + 1;
+                    variable.inserta_varopt_operacion('P', oper, indice);
+                    elred = variable.entrega_elemento_red(); 
+                    if isa(elred, 'cLinea') || isa(elred, 'cTransformador2D')
+                    	sr = elred.entrega_sr_pu();
+                        this.lb(indice) = -sr;
+                        this.ub(indice) = sr;
+                    else
+                        error = MException('cOPF:agrega_variable','Tipo de variable serie aún no implementada. Sólo líneas y transformadores');
+                        throw(error)
+                    end
+                    if this.iNivelDebug > 0
+                    	this.ingresa_nombres(length(this.VarOpt), indice, oper, 'VariableAuxiliar', 'P');
+                    end
+                    this.actualiza_balance_energia(variable, oper);
+                    this.agrega_relaciones_flujos_angulos(variable, oper)
+                end
+            else
+                error = MException('cOPF:agrega_variable','Tipo de variable aún no implementada. Sólo buses y elementos serie. Ningún elemento paralelo');
+                throw(error)
+            end
+        end
+
+        function elimina_variable(this, variable)
+            % variable es elemento del sistema modal
+            % Esta función es peligrosa. Fue definida sólo para
+            % TNEP para mejorar performance!
+            
+            for oper = 1:length(this.vPuntosOperacion)
+                % primero identifica id de restricción
+                if isa(variable, 'cmBus')
+                    indice_varopt_operacion = variable.entrega_varopt_operacion('Theta',oper);
+                    % se elimina balance de energía. Se verifica eso sí que no
+                    % haya ningún elemento conectado aún
+                    id_restriccion = variable.entrega_indice_restriccion_balance_energia(oper);
+                    if ~isempty(nonzeros(this.Aeq(id_restriccion,:)))
+                        error = MException('cOPF:elimina_variable','Error de programación. No se puede eliminar bus, porque aún existen variables en balance de energía!');
+                        throw(error)
+                    end
+                elseif isa(variable, 'cmElementoSerie')
+                    indice_varopt_operacion = variable.entrega_varopt_operacion('P',oper);
+                    %elimina variable de balance de energía
+                    id_restriccion = variable.entrega_indice_restriccion_flujos_angulos(oper);
+                else
+                    error = MException('cOPF:elimina_variable','Error de programación. Sólo se pueden eliminar buses o elementos serie. No elementos paralelos');
+                    throw(error)
+                end
+                
+                % elimina restriccion
+                this.Aeq(id_restriccion,:) = [];
+                this.beq(id_restriccion,:) = [];
+                this.iIndiceEq = this.iIndiceEq - 1;
+
+                if ~isempty(this.NombreEq)
+                    this.NombreEq(id_restriccion) = [];
+                end
+                
+                %actualiza índices de restricciones de igualdad para el resto
+                %de los elementos (buses y elementos serie). 
+                %RAMRAM TODO: Eventualmente un método más eficiente?
+                for i = 1:length(this.VarOpt)
+                    for j = 1:length(this.vPuntosOperacion)
+                        if isa(this.VarOpt(i), 'cmBus')
+                        	id_be = this.VarOpt(i).entrega_indice_restriccion_balance_energia(j);
+                            if id_be > id_restriccion
+                            	this.VarOpt(i).agrega_indice_restriccion_balance_energia(j, id_be - 1);
+                            end
+                        elseif isa(this.VarOpt(i), 'cmElementoSerie')
+                        	id_fa = this.VarOpt(i).entrega_indice_restriccion_flujos_angulos(j);
+                            if id_fa > id_restriccion
+                                this.VarOpt(i).agrega_indice_restriccion_flujos_angulos(j,id_fa - 1);
+                            end
+                        end
+                    end
+                end
+                
+                % elimina variable de contenedores
+                this.Fobj(indice_varopt_operacion) = [];
+                this.lb(indice_varopt_operacion) = [];
+                this.ub(indice_varopt_operacion) = [];
+                if ~isempty(this.NombreVariables)
+                    this.NombreVariables(indice_varopt_operacion) = [];
+                end
+                this.Aeq(:,indice_varopt_operacion) = [];
+
+                % actualiza índice del resto de las variables
+                % TODO RAMRAM: Puede no ser eficiente... alternativa?
+                for i = 1:length(this.VarOpt)
+                    for j = 1:length(this.vPuntosOperacion)
+                        if isa(this.VarOpt(i), 'cmBus')
+                            id_varopt_op = this.VarOpt(i).entrega_varopt_operacion('Theta',j);
+                            if id_varopt_op > indice_varopt_operacion
+                                this.VarOpt(i).inserta_varopt_operacion('Theta', j, id_varopt_op - 1);
+                            end
+                        else
+                            id_varopt_op = this.VarOpt(i).entrega_varopt_operacion('P',j);
+                            if id_varopt_op > indice_varopt_operacion
+                                this.VarOpt(i).inserta_varopt_operacion('P', j,id_varopt_op - 1);
+                            end
+                        end
+                    end
+                end
+            end
+            
+            % finalmente se borra varopt
+            id_varopt = variable.entrega_indice_varopt();
+            this.VarOpt(id_varopt) = [];
+            this.TipoVarOpt(id_varopt) = [];
+            this.UnidadesVarOpt(id_varopt) = [];
+
+            for i = 1:length(this.VarOpt)
+                id_otro = this.VarOpt(i).entrega_indice_varopt();
+                if id_otro > id_varopt
+                    this.VarOpt(i).inserta_indice_varopt(id_otro-1);
+                end
+            end
+        end
+        
+        function inicializa_contenedores(this)
+            % se inicializan las dimensiones de las matrices. 
+
+            n_var = length(this.VarOpt)*this.iCantPuntosOperacion;
+            this.Fobj = zeros(n_var, 1);
+            
+            % Restricciones de igualdad contiene: 
+            % 1. Balance de energía por nodo y punto de operación
+            %    Cantidad: #buses *#po
+            % 2. Restricciones flujos-ángulos
+            %    Cantidad: #elementos serie *#po
+
+            n_buses = this.pSM.entrega_cantidad_buses();
+            n_serie = this.pSM.entrega_cantidad_elementos_serie();
+            cantidad_eq = (n_buses+n_serie)*this.iCantPuntosOperacion;
+     
+            this.Aeq = zeros(cantidad_eq, n_var);
+            this.beq = zeros(cantidad_eq, 1);
+            %this.NombreEq = cell(cantidad_rest_igualdad,1);        
+            if this.iNivelDebug > 0
+                this.NombreEq = cell(cantidad_eq,1);
+            end
+            % por ahora no hay restricciones de desigualdad
+            cantidad_ineq = 0;
+            this.Aineq = [];
+            this.bineq = [];
+            
+            if this.iNivelDebug > 1
+                prot = cProtocolo.getInstance;
+                prot.imprime_texto('Dimension de contenedores (antes de escribir las restricciones)');
+                prot.imprime_texto(['Cantidad variables decision: ' num2str(n_var)]);
+                prot.imprime_texto(['Cantidad rest. igualdad: ' num2str(cantidad_eq)]);
+                prot.imprime_texto(['Cantidad rest. desigualdad: ' num2str(cantidad_ineq)]);
+            end
+        end
+        
+        function escribe_funcion_objetivo(this)
+            if strcmp(this.pParOpt.entrega_funcion_objetivo(), 'MinC')
+                for oper = 1:length(this.vPuntosOperacion)
+                    % Costo de generación
+                    % no es eficiente pero en este punto no se necesita
+                    % rapidez (... o si? TODO: Evaluar!)
+                    for i = 1:length(this.VarOpt)
+                        elred = this.VarOpt(i).entrega_elemento_red();
+                        if isa(elred, 'cGenerador')
+                            if strcmp(this.TipoVarOpt{i}, 'VariableControl')
+                                costo_mwh = elred.entrega_costo_mwh_pu();
+                                indice = this.VarOpt(i).entrega_varopt_operacion('P',oper);
+                                this.Fobj(indice) = round(costo_mwh,5);
+                            elseif strcmp(this.TipoVarOpt{i}, 'VariableAuxiliar')
+                                penalizacion = this.pParOpt.entrega_penalizacion_recorte_res(); % en $/MWh
+                                sbase = cParametrosSistemaElectricoPotencia.getInstance.entrega_sbase();
+                                indice = this.VarOpt(i).entrega_varopt_operacion('P',oper);
+                                this.Fobj(indice) = round(penalizacion*sbase,5);
+                            end
+                        elseif isa(elred, 'cConsumo')
+                            costo_desconexion = elred.entrega_costo_desconexion_carga_pu();
+                            if costo_desconexion == 0
+                                error = MException('cOPF:escribe_funcion_objetivo','Costo de desconexión de carga igual a cero');
+                                throw(error)
+                            end
+                            indice = this.VarOpt(i).entrega_varopt_operacion(this.UnidadesVarOpt{i}, oper);
+                            this.Fobj(indice) = round(costo_desconexion,5);
+                        end
+                    end
+                end
+            else
+                error = MException('cOPF:escribe_funcion_objetivo','Función objetivo indicada no implementada');
+                throw(error)
+            end
+        end
+        
+        function escribe_restricciones(this)
+            for oper = 1:length(this.vPuntosOperacion)
+                this.escribe_balance_energia(oper);
+                this.escribe_relaciones_flujos_angulos(oper);
+                % no se necesita restringir el ángulo máximo entre los
+                % buses, ya que flujo máximo por las líneas es más
+                % restrictivo
+                %this.escribe_restricciones_angulos_buses(oper);
+            end
+        end
+
+        function escribe_balance_energia(this, oper)
+            pBuses = this.pSM.entrega_buses();
+            for i = 1:length(pBuses)
+                this.iIndiceEq = this.iIndiceEq +1;
+                pBuses(i).agrega_indice_restriccion_balance_energia(oper, this.iIndiceEq);
+                
+                % Balance de potencia activa en bus
+                %generadores
+                pGeneradores = pBuses(i).entrega_generadores_despachables();
+                for j = 1:length(pGeneradores)
+                    indice_gen = pGeneradores(j).entrega_varopt_operacion('P', oper);
+                    this.Aeq(this.iIndiceEq,indice_gen) = 1;
+                end
+
+                %ENS
+                if this.pParOpt.considera_desprendimiento_carga()
+                    pConsumos = pBuses(i).entrega_consumos();
+                    for j = 1:length(pConsumos)
+                        indice_consumo = pConsumos(j).entrega_varopt_operacion('P', oper);
+                        this.Aeq(this.iIndiceEq,indice_consumo) = 1;
+                    end
+                end
+                
+                % Recorte RES.
+                if this.pParOpt.ConsideraRecorteRES
+                    pGeneradores_ernc = pBuses(i).entrega_generadores_ernc();
+                    for j = 1:length(pGeneradores_ernc)
+                        indice_generador = pGeneradores_ernc(j).entrega_varopt_operacion('P', oper);
+                        this.Aeq(this.iIndiceEq,indice_generador) = -1;
+                    end
+                end
+                
+                %consumo residual
+                if this.DatosEscenarioLocal
+                    consumo_residual_p = 0;
+                    elpar = pBuses(i).entrega_elementos_paralelos();
+                    for ii = 1:length(elpar)
+                        valor_elemento = 0;
+                        el_red = elpar(ii).entrega_elemento_red();
+                        if isa(el_red, 'cConsumo')
+                            indice = el_red.entrega_indice_escenario();
+                            valor_elemento = -this.SerieConsumos(indice, oper)/this.Sbase;
+                        elseif isa(el_red, 'cGenerador')
+                            if el_red.es_ernc()
+                                indice = el_red.entrega_indice_escenario();
+                                valor_elemento = this.SerieGeneradoresERNC(indice, oper)/this.Sbase;
+                            end
+                        end
+                        consumo_residual_p = consumo_residual_p + valor_elemento;
+                    end
+                elseif ~isempty(this.pAdmSc)
+                    consumo_residual_p = pBuses(i).entrega_p_const_nom_opf(this.iEtapa, oper);
+                else
+                    consumo_residual_p = pBuses(i).entrega_p_const_nom_opf();
+                end
+                this.beq(this.iIndiceEq) = round(-consumo_residual_p,5);
+                                
+                % elementos serie
+                eserie = pBuses(i).entrega_elementos_serie();
+                for j = 1:length(eserie)
+                    indice_eserie_p = eserie(j).entrega_varopt_operacion('P', oper);
+                    
+                    bus1 = eserie(j).entrega_bus1();
+                    bus2 = eserie(j).entrega_bus2();
+                    if bus1 == pBuses(i)
+                        % inicio linea corresponde a este bus, por lo tanto
+                        % flujo sale
+                        signo = -1;
+                    elseif bus2 == pBuses(i)
+                        signo = 1;
+                    else
+                        error = MException('cOPF:escribe_balance_energia','Inconsistencia en los datos, ya que elemento serie no pertenece a bus');
+                        throw(error)
+                    end
+                    this.Aeq(this.iIndiceEq,indice_eserie_p) = signo;
+                    if this.iNivelDebug > 0
+                        this.NombreEq{this.iIndiceEq} = strcat('req_', num2str(this.iIndiceEq), '_be_', 'B', num2str(pBuses(i).entrega_id_global()), '_O', num2str(oper));
+                    end
+                end
+            end
+        end
+
+        function actualiza_balance_energia(this, variable, oper)
+            indice_eserie_p = variable.entrega_varopt_operacion('P', oper);
+
+            bus1 = variable.entrega_bus1();
+            indice_eq = bus1.entrega_indice_restriccion_balance_energia(oper);
+            this.Aeq(indice_eq,indice_eserie_p) = -1;
+            
+            bus2 = variable.entrega_bus2();
+            indice_eq = bus2.entrega_indice_restriccion_balance_energia(oper);
+            this.Aeq(indice_eq,indice_eserie_p) = 1;
+        end
+        
+        function agrega_balance_energia(this, bus, oper)
+            % Función sólo para utilizar con TNEP.
+            this.iIndiceEq = this.iIndiceEq +1;
+            bus.agrega_indice_restriccion_balance_energia(oper, this.iIndiceEq);
+            this.Aeq = [this.Aeq; zeros(1,length(this.Fobj))];
+            % Balance de potencia activa en bus
+            %generadores
+            pGeneradores = bus.entrega_generadores_despachables();
+            if ~isempty(pGeneradores)
+                error = MException('cOPF:agrega_balance_energia','Error de programación. Función no acepta generadores en nuevos buses');
+                throw(error)
+            end
+                    
+            elpar = bus.entrega_elementos_paralelos();
+            if ~isempty(elpar)
+                error = MException('cOPF:agrega_balance_energia','Error de programación. Función no acepta elementos paralelos en nuevos buses');
+                throw(error)
+            end
+            this.beq(this.iIndiceEq) = 0;
+                
+            pConsumos = bus.entrega_consumos();
+            if ~isempty(pConsumos)
+                error = MException('cOPF:agrega_balance_energia','Error de programación. Función no acepta consumos en nuevos buses');
+                throw(error)
+            end
+            
+            % elementos serie
+            eserie = bus.entrega_elementos_serie();
+            if ~isempty(eserie)
+                error = MException('cOPF:agrega_balance_energia','Error de programación. Bus se acaba de agregar como variable independiente, por lo que aún no debiera tener elementos en serie conectados');
+                throw(error)
+            end
+            
+            if this.iNivelDebug > 0
+            	this.NombreEq{this.iIndiceEq} = strcat('req_', num2str(this.iIndiceEq), '_be_', 'B', num2str(bus.entrega_id_global()), '_O', num2str(oper));
+            end
+        end
+
+        
+        function escribe_relaciones_flujos_angulos(this, oper)
+            eserie = this.pSM.entrega_elementos_serie();
+            for i = 1:length(eserie)
+                this.iIndiceEq = this.iIndiceEq +1;
+            
+                eserie(i).agrega_indice_restriccion_flujos_angulos(oper, this.iIndiceEq);
+                
+                id_eserie = eserie(i).entrega_varopt_operacion('P', oper);
+                bus1 = eserie(i).entrega_bus1();
+                bus2 = eserie(i).entrega_bus2();
+                id_t1 = bus1.entrega_varopt_operacion('Theta', oper);
+                id_t2 = bus2.entrega_varopt_operacion('Theta', oper);
+                
+                x = eserie(i).entrega_reactancia();
+
+                this.Aeq(this.iIndiceEq,id_eserie) = round(x,5);
+                this.Aeq(this.iIndiceEq,id_t1) = -1;
+                this.Aeq(this.iIndiceEq,id_t2) = 1;
+                this.beq(this.iIndiceEq) = 0;
+                
+                if this.pParOpt.entrega_flujo_dc_con_perdidas()
+                    % se agregan las pérdidas. Aún no está implementado
+                    % porque introduce relaciones cuadráticas con los
+                    % ángulos
+                    % fórmula: r/(2x^2)*(t1-t2)^2
+                    r = eserie(i).entrega_resistencia();
+                    factor = r/(2*x^2);
+                    error = MException('cDCOPF:escribe_relaciones_flujos_angulos','OPF DC con pérdidas aún no implementado');
+                    throw(error)
+                end
+                
+                if this.iNivelDebug > 0
+                    id_par = eserie(i).entrega_elemento_red().entrega_indice_paralelo();
+                    if isa(eserie(i).entrega_elemento_red(), 'cLinea')
+                        texto = 'L';
+                    else
+                        texto = 'Tr';
+                    end
+                	this.NombreEq{this.iIndiceEq} = strcat('req_', num2str(this.iIndiceEq), '_flujos_angulos', texto, num2str(id_par), ...
+                        '_B', num2str(bus1.entrega_id_global()), '_', num2str(bus2.entrega_id_global()), '_O', num2str(oper));
+                end
+            end
+        end
+
+        function agrega_relaciones_flujos_angulos(this, variable, oper)
+            this.iIndiceEq = this.iIndiceEq +1;
+
+            variable.agrega_indice_restriccion_flujos_angulos(oper, this.iIndiceEq);
+            
+            id_eserie = variable.entrega_varopt_operacion('P', oper);
+            bus1 = variable.entrega_bus1();
+            bus2 = variable.entrega_bus2();
+            id_t1 = bus1.entrega_varopt_operacion('Theta', oper);
+            id_t2 = bus2.entrega_varopt_operacion('Theta', oper);
+                
+            x = variable.entrega_reactancia();
+
+            this.Aeq(this.iIndiceEq,id_eserie) = round(x,5);
+            this.Aeq(this.iIndiceEq,id_t1) = -1;
+            this.Aeq(this.iIndiceEq,id_t2) = 1;
+            this.beq(this.iIndiceEq) = 0;
+                
+            if this.pParOpt.entrega_flujo_dc_con_perdidas()
+                error = MException('cDCOPF:agrega_relaciones_flujos_angulos','OPF DC con pérdidas aún no implementado');
+                throw(error)
+            end
+                
+            if this.iNivelDebug > 0
+            	id_par = variable.entrega_elemento_red().entrega_indice_paralelo();
+                if isa(variable.entrega_elemento_red(), 'cLinea')
+                    texto = 'L';
+                else
+                    texto = 'Tr';
+                end
+                this.NombreEq{this.iIndiceEq} = strcat('req_', num2str(this.iIndiceEq), '_flujos_angulos', texto, num2str(id_par), ...
+                	'_B', num2str(bus1.entrega_id_global()), '_', num2str(bus2.entrega_id_global()), '_O', num2str(oper));
+            end
+        end
+        
+        function optimiza(this)
+            if this.pParOpt.entrega_flujo_dc_con_perdidas()
+                error = MException('cDCOPF:optimiza','OPF DC con pérdidas aún no implementado');
+                throw(error)
+            else
+                if this.iNivelDebug > 1
+                    prot = cProtocolo.getInstance;
+                    prot.imprime_texto('Comienzo proceso optimizacion OPF DC');
+                    if this.iNivelDebug > 2
+                        prot.imprime_texto('Dimensiones del problema:');
+                        prot.imprime_texto(strcat('Cantidad de variables de decision: ', num2str(length(this.VarOpt))));
+                        prot.imprime_texto(strcat('Dimension de funcion objetivo: ', num2str(length(this.Fobj))));
+                        [m, n] = size(this.Aineq);
+                        prot.imprime_texto(strcat('Dimension matriz de desigualdad: ', num2str(m), 'x', num2str(n)));
+                        prot.imprime_texto(strcat('Dimension vector de desigualdad: ', num2str(length(this.bineq))));
+                        prot.imprime_texto(strcat('Cantidad desigualdades: ', num2str(this.iIndiceIneq)));
+                        [m, n] = size(this.Aeq);
+                        prot.imprime_texto(strcat('Dimension matriz de igualdad: ', num2str(m), 'x', num2str(n)));
+                        prot.imprime_texto(strcat('Dimension vector de igualdad: ', num2str(length(this.beq))));
+                        prot.imprime_texto(strcat('Cantidad igualdades: ', num2str(this.iIndiceEq)));
+                        prot.imprime_texto(strcat('Dimension vector lb: ', num2str(length(this.lb))));
+                        prot.imprime_texto(strcat('Dimension vector ub: ', num2str(length(this.ub))));
+                    end
+                end
+                if strcmp(this.pParOpt.Solver, 'Intlinprog')
+                    if this.iNivelDebug > 0
+                        if this.iNivelDebug > 1
+                            options = optimoptions('linprog','Display','iter');
+                        else
+                            options = optimoptions('linprog','Display','final');
+                        end
+                    else
+                        options = optimoptions('linprog','Display','off');
+                    end
+                
+                    if this.MuestraDetalleIteraciones
+                        % fuerza mostrar el detalle de las iteraciones,
+                        % independiente del nivel de debug
+                        options = optimoptions('linprog','Display','iter');
+                    end
+                    
+                    [this.ResOptimizacion, this.Fval,this.ExitFlag,this.Output,this.Lambda]= linprog(this.Fobj,this.Aineq,this.bineq,this.Aeq,this.beq,this.lb,this.ub, [], options);
+                elseif strcmp(this.pParOpt.Solver, 'Xpress')
+                    options = xprsoptimset(optimset('Display', 'off'));
+                    if this.MuestraDetalleIteraciones
+                        options = xprsoptimset(optimset('Display', 'iter'));
+                    end
+                    rtype = [repmat('L',[1 size(this.Aineq,1)]) repmat('E',[1 size(this.Aeq,1)])];
+                    [this.ResOptimizacion,this.Fval,this.ExitFlag,this.Output] = xprslp(this.Fobj,[this.Aineq; this.Aeq], [this.bineq; this.beq], rtype, this.lb,this.ub, options);%, options);
+                	
+                else
+                    error = MException('cDCOPF:optimiza',...
+                                       ['Optimizador "' this.pParOpt.Solver ' no está implementado']);
+                    throw(error)    
+                end
+                %redondea resultados
+                this.ResOptimizacion = round(this.ResOptimizacion,5);
+            end
+        end
+        
+		function escribe_resultados(this)
+            %primero una función de chequeo
+            sbase = cParametrosSistemaElectricoPotencia.getInstance.entrega_sbase();
+            for oper = 1:length(this.vPuntosOperacion)
+                buses = this.pSM.entrega_buses();
+                for bus = 1:length(buses)
+                    %ángulo del bus
+                    se = buses(bus).entrega_elemento_red();
+                    id_se = se.entrega_id();
+                    indice_opt = buses(bus).entrega_varopt_operacion('Theta', oper);
+                    theta = this.ResOptimizacion(indice_opt);                                    
+                    this.pResEvaluacion.AnguloSubestaciones(id_se, oper) = theta/pi*180;
+                    
+                    %generadores
+                    generadores = buses(bus).entrega_generadores_despachables();
+                    for gen = 1:length(generadores)
+                        el_red = generadores(gen).entrega_elemento_red();                        
+                        id_gen = el_red.entrega_id_resultado_evaluacion();
+                        costo_mwh = el_red.entrega_costo_mwh();
+                        indice_opt = generadores(gen).entrega_varopt_operacion('P', oper);
+                        p_mw = this.ResOptimizacion(indice_opt)*sbase;
+                        if strcmp(this.pParOpt.entrega_tipo_problema(), 'Redespacho')
+                        	this.pResEvaluacion.CostoRedespacho(oper) = this.pResEvaluacion.CostoRedespacho(oper) + costo_mwh * p_mw;
+                            p0 = el_red.entrega_p0();
+                            p_mw = p_mw + p0;
+                        end
+                        this.pResEvaluacion.GeneradoresDespachablesP(id_gen, oper) = p_mw;
+                        this.pResEvaluacion.CostoGeneracion(oper) = this.pResEvaluacion.CostoGeneracion(oper) + costo_mwh*p_mw;
+                    end
+                                        
+                    %consumos                    
+                    consumos = buses(bus).entrega_consumos();
+                    for con = 1:length(consumos)
+                        elred = consumos(con).entrega_elemento_red();
+                        id_elred = elred.entrega_id();
+                        
+                        if this.pParOpt.considera_desprendimiento_carga()
+                            indice_opt = consumos(con).entrega_varopt_operacion('P', oper);
+                            ens = this.ResOptimizacion(indice_opt)*sbase;
+                            this.pResEvaluacion.ENSConsumos(id_elred, oper) = ens;
+                        else
+                            ens = 0;
+                        end
+                        if this.DatosEscenarioLocal
+                            id_consumo_sc = elred.entrega_indice_escenario();
+                            p0 = this.SerieConsumos(id_consumo_sc, oper);                            
+                        elseif ~isempty(this.pAdmSc)
+                        	% factor de expansión para TNEP
+                            id_consumo_sc = elred.entrega_indice_escenario();
+                            p0 = this.pAdmSc.entrega_consumo(id_consumo_sc, this.iEtapa, oper);
+                        else
+                            p0 = -elred.entrega_p_const_nom(); %p0 tiene valor positivo
+                        end
+
+                        this.pResEvaluacion.ConsumosP(id_elred, oper) = p0-ens;
+                        if ens > 0
+                        	costo_desconexion = elred.entrega_costo_desconexion_carga();
+                            costo_ens = ens*costo_desconexion;
+                            this.pResEvaluacion.CostoENS(oper) = this.pResEvaluacion.CostoENS(oper) + costo_ens;
+                        end
+                    end
+                    
+                    generadores_ernc = buses(bus).entrega_generadores_ernc();
+                    for gen = 1:length(generadores_ernc)
+                        el_red = generadores_ernc(gen).entrega_elemento_red();                        
+                        id_gen = el_red.entrega_id_resultado_evaluacion();
+                        id_generador_sc = el_red.entrega_indice_escenario();
+                        if this.DatosEscenarioLocal
+                            pnom = this.SerieGeneradoresERNC(id_generador_sc, oper);
+                        elseif ~isempty(this.pAdmSc)
+                            pnom = this.pAdmSc.entrega_inyeccion(id_generador_sc, this.iEtapa, oper);
+                        else
+                            pnom = elred.entrega_pmax_pu();
+                        end
+                        p_mw_recorte = 0;
+                        if this.pParOpt.ConsideraRecorteRES
+                            indice_opt = generadores_ernc(gen).entrega_varopt_operacion('P', oper);
+                            p_mw_recorte = this.ResOptimizacion(indice_opt)*sbase;
+                            this.pResEvaluacion.RecorteGeneradoresRES(id_gen, oper) = p_mw_recorte;
+                            if p_mw_recorte > 0
+                                penalizacion = this.pParOpt.entrega_penalizacion_recorte_res(); % en $/MWh
+                                costo_recorte = p_mw_recorte*penalizacion;
+                                this.pResEvaluacion.CostoRecorteGeneradoresRES(oper) = this.pResEvaluacion.CostoRecorteGeneradoresRES(oper) + costo_recorte;
+                            end
+                        end
+                        this.pResEvaluacion.GeneradoresRESP(id_gen, oper) = pnom - p_mw_recorte;
+                    end
+                    
+                    %lineas y trafos
+                    eserie = buses(bus).entrega_elementos_serie();
+                    for j = 1:length(eserie)                    
+                        bus1 = eserie(j).entrega_bus1();
+                        if bus1 ~= buses(bus)
+                            %Sólo para bus inicial para no repetir
+                            continue;
+                        end
+                        indice_opt = eserie(j).entrega_varopt_operacion('P', oper);
+                        elred = eserie(j).entrega_elemento_red();
+                        sr = elred.entrega_sr();
+                        flujo_p = this.ResOptimizacion(indice_opt)*sbase;
+                        porcentaje_uso = abs(flujo_p)/sr;
+                        id_elred = elred.entrega_id();
+                        if isa(elred, 'cLinea')
+                            this.pResEvaluacion.FlujoLineasP(id_elred, oper) = flujo_p;
+                            if elred.tiene_flag_observacion()
+                                if porcentaje_uso > this.pParOpt.PorcentajeUsoFlujosAltos
+                                    this.pResEvaluacion.inserta_linea_flujo_maximo(elred, porcentaje_uso);
+                                elseif porcentaje_uso < this.pParOpt.PorcentajeUsoFlujosBajos % bajo flujo
+                                    this.pResEvaluacion.inserta_linea_poco_uso(elred, porcentaje_uso);
+                                end
+                            end
+                        elseif  isa(elred, 'cTransformador2D')
+                            this.pResEvaluacion.FlujoTransformadoresP(id_elred, oper) = flujo_p;
+                            if elred.tiene_flag_observacion()
+                                if porcentaje_uso > this.pParOpt.PorcentajeUsoFlujosAltos % flujo por trafo mayor al 95%
+                                    this.pResEvaluacion.inserta_trafo_flujo_maximo(elred, porcentaje_uso);
+                                elseif porcentaje_uso < this.pParOpt.PorcentajeUsoFlujosBajos % bajo flujo
+                                    this.pResEvaluacion.inserta_trafo_poco_uso(elred, porcentaje_uso);
+                                end
+                            end
+                        else
+                            error = MException('cDCOPF:escribe_resultados',...
+                                    ['Tipo elemento (' class(elred) ' aún no implementado']);
+                            throw(error)
+                        end
+                    end % fin elementos serie
+                end %fin buses
+            end
+            
+            if this.InsertaResultadosEnSEP
+                this.pResEvaluacion.inserta_resultados_en_sep();
+            end
+        end
+
+        function imprime_resultados_protocolo(this)
+            prot = cProtocolo.getInstance;
+            sbase = cParametrosSistemaElectricoPotencia.getInstance.entrega_sbase();
+            if this.iNivelDebug > 1
+                prot.imprime_texto('');
+                prot.imprime_texto('Resultados DC-OPF');
+                prot.imprime_texto('Resultado variables optimizacion');
+                for i = 1:length(this.ResOptimizacion)
+                    texto = sprintf('%10s %5s %35s %3s %10s %5s %10s ', ...
+                        num2str(this.lb(i)), '<=', this.NombreVariables{i}, '=', ...
+                        num2str(this.ResOptimizacion(i)), '<=', num2str(this.ub(i)));
+                    prot.imprime_texto(texto);
+                end
+            end
+            
+            for oper = 1:length(this.vPuntosOperacion)
+                prot.imprime_texto(['PO: ' num2str(oper)]);
+                prot.imprime_texto('Balance de energia');
+                texto = sprintf('%-15s %-15s %-10s %-15s %-10s %-10s %-10s %-10s', 'Subestacion', 'Generacion', 'Consumo', 'ENS','Recorte RES', 'Pin', 'Pout', 'Balance');
+                prot.imprime_texto(texto);
+                buses = this.pSM.entrega_buses();
+                for bus = 1:length(buses)
+                	suma_gen = 0;
+                    suma_capacidad_gen = 0;
+                    generadores = buses(bus).entrega_generadores_despachables();
+                    for gen = 1:length(generadores)
+                        el_red = generadores(gen).entrega_elemento_red();
+                        indice_opt = generadores(gen).entrega_varopt_operacion('P', oper);
+                        p_mw = this.ResOptimizacion(indice_opt)*sbase;
+                        if strcmp(this.pParOpt.entrega_tipo_problema(), 'Redespacho')
+                            p0 = el_red.entrega_p0();
+                            p_mw = p_mw + p0;
+                        end
+                        if this.DatosEscenarioLocal
+                            id_generador_sc = el_red.entrega_indice_escenario();
+                            pmax = this.CapacidadGeneradores(id_generador_sc);
+                        elseif ~isempty(this.pAdmSc)
+                        	% factor de expansión para TNEP
+                            id_generador_sc = el_red.entrega_indice_escenario();
+                            pmax = this.pAdmSc.entrega_capacidad_generador(id_generador_sc, this.iEtapa);
+                        else
+                            pmax = elred.entrega_pmax();
+                        end
+                        suma_capacidad_gen = suma_capacidad_gen + pmax;
+                        suma_gen = suma_gen + p_mw;
+                    end
+                    
+                    % generadores RES
+                    p_mw_recorte_total = 0;
+                    generadores_ernc = buses(bus).entrega_generadores_ernc();
+                    for gen = 1:length(generadores_ernc)
+                        el_red = generadores_ernc(gen).entrega_elemento_red();
+                        id_generador_sc = el_red.entrega_indice_escenario();
+                        if this.DatosEscenarioLocal
+                            pnom = this.SerieGeneradoresERNC(id_generador_sc, oper);
+                        elseif ~isempty(this.pAdmSc)
+                            pnom = this.pAdmSc.entrega_inyeccion(id_generador_sc, this.iEtapa, oper);
+                        else
+                            pnom = elred.entrega_pmax_pu();
+                        end
+                        p_mw_recorte = 0;
+                        if this.pParOpt.ConsideraRecorteRES
+                            indice_opt = generadores_ernc(gen).entrega_varopt_operacion('P', oper);
+                            p_mw_recorte = this.ResOptimizacion(indice_opt)*sbase;
+                            p_mw_recorte_total = p_mw_recorte_total + p_mw_recorte;
+                        end
+                        suma_capacidad_gen = suma_capacidad_gen + pnom;
+                        suma_gen = suma_gen + pnom - p_mw_recorte;
+                    end
+                                        
+                    %consumos
+                    p_consumo = 0;
+                    p_ens = 0;
+                    consumos = buses(bus).entrega_consumos();
+                    for con = 1:length(consumos)
+                        elred = consumos(con).entrega_elemento_red();
+
+                        if this.pParOpt.considera_desprendimiento_carga()
+                            indice_opt = consumos(con).entrega_varopt_operacion('P', oper);
+                            ens = this.ResOptimizacion(indice_opt)*sbase;
+                        else
+                            ens = 0;
+                        end
+                        if this.DatosEscenarioLocal
+                            id_consumo_sc = elred.entrega_indice_escenario();
+                            p0 = this.SerieConsumos(id_consumo_sc, oper);
+                        elseif ~isempty(this.pAdmSc)
+                        	% factor de expansión para TNEP
+                            id_consumo_sc = elred.entrega_indice_escenario();
+                            p0 = this.pAdmSc.entrega_consumo(id_consumo_sc, this.iEtapa, oper);
+                        else
+                            p0 = -elred.entrega_p_const_nom(); %p0 tiene valor positivo
+                        end
+
+                        p_consumo = p_consumo + p0-ens;
+                        p_ens = p_ens + ens;
+                    end
+                    
+                    %lineas y trafos
+                    pin = 0;
+                    pout = 0;
+                    eserie = buses(bus).entrega_elementos_serie();
+                    for j = 1:length(eserie)                    
+                        bus1 = eserie(j).entrega_bus1();
+                        if bus1 == buses(bus)
+                            signo = -1;
+                        else
+                            signo = 1;
+                        end
+                        
+                        indice_opt = eserie(j).entrega_varopt_operacion('P', oper);
+                        flujo_p = this.ResOptimizacion(indice_opt)*sbase;
+                        if signo*flujo_p < 0
+                        	pout = pout - signo*flujo_p;
+                        else
+                        	pin = pin + signo*flujo_p;
+                        end                        
+                    end % fin elementos serie
+                        
+                    texto_generacion = [num2str(suma_gen) '/' num2str(suma_capacidad_gen)];
+                    texto = sprintf('%-15s %-15s %-10s %-15s %-10s %-10s %-10s %-10s', buses(bus).entrega_elemento_red().entrega_nombre(), ...
+                    	texto_generacion,...
+                        num2str(round(p_consumo,5)),...
+                        num2str(round(p_ens,5)),...
+                        num2str(round(p_mw_recorte_total,5)),...
+                        num2str(round(pin,5)),...
+                        num2str(round(pout,5)),...
+                        num2str(round(suma_gen-p_consumo++p_ens+pin-pout,5)));
+                    prot.imprime_texto(texto);
+                end %fin buses
+                
+                % ahora se imprimen los resultados por subestación detallando
+                % las líneas/trafos
+                prot.imprime_texto('');
+                prot.imprime_texto('Detalle de flujos por subestacion');
+                texto = sprintf('%-25s %-15s %-15s %-7s %-8s %-8s %-8s %-8s %-8s %-8s %-25s', ...
+                        'Linea', 'SE1', 'SE2', 'Signo', 'T1grad', 'T2grad', 'T1-T2', 'Xel', 'PMW', 'Pmax', 'Dif.calculado');
+                prot.imprime_texto(texto);
+                for bus1 = 1:length(buses)
+                    eserie = buses(bus1).entrega_elementos_serie();
+                    for bus2 = bus1+1:length(buses)
+                        for j = 1:length(eserie)
+                            bus_inicial = eserie(j).entrega_bus1();
+                            bus_final = eserie(j).entrega_bus2();
+                            
+                            if bus_inicial ~= buses(bus2) && bus_final ~= buses(bus2)
+                                continue;
+                            end
+                                indice_eserie_p = eserie(j).entrega_varopt_operacion('P', oper);
+                                p_serie = this.ResOptimizacion(indice_eserie_p)*sbase;
+                                sr = eserie(j).entrega_elemento_red().entrega_sr();
+                                
+                            	indice_bus1 = buses(bus1).entrega_varopt_operacion('Theta', oper);
+                                t1 = this.ResOptimizacion(indice_bus1);
+                                indice_bus2 = buses(bus2).entrega_varopt_operacion('Theta', oper);
+                                t2 = this.ResOptimizacion(indice_bus2);
+
+                                if bus_inicial == buses(bus1)
+                                    signo = 1; % linea va de SE1 a SE2 por lo que flujo sale de la subestacion
+                                else
+                                    signo = -1;
+                                end
+                                x = eserie(j).entrega_reactancia();
+                                angulo_1 = round(t1/pi*180,1);
+                                angulo_2 = round(t2/pi*180,1);
+                                        
+                                diff_angulo = round((t1-t2)/pi*180,1);
+                                diff_calculado = signo*(t1-t2)/x*sbase;
+                                diff_calculado = diff_calculado-p_serie;
+                                texto = sprintf('%-25s %-15s %-15s %-7s %-8s %-8s %-8s %-8s %-8s %-8s %-25s', ...
+                                        eserie(j).entrega_elemento_red().entrega_nombre(), ...
+                                        buses(bus1).entrega_elemento_red().entrega_nombre(), ...
+                                        buses(bus2).entrega_elemento_red().entrega_nombre(), ...
+                                        num2str(signo), ...
+                                        num2str(angulo_1), ...
+                                        num2str(angulo_2), ...
+                                        num2str(diff_angulo), ...
+                                        num2str(round(x,3)), ...
+                                        num2str(round(p_serie,3)), ...
+                                        num2str(round(sr,3)), ...
+                                        num2str(round(diff_calculado,2)));
+                                    prot.imprime_texto(texto);
+                        end
+                    end %fin subestaciones
+                end % fin puntos de operación
+            end
+        end
+        
+        function evaluacion = entrega_evaluacion(this)
+            evaluacion = this.pResEvaluacion;
+        end
+        
+        function imprime_problema_optimizacion(this, varargin)
+            % sólo en modo debug. imprime el problema en archivo externo
+            % determina nombre de variables de optimización
+            % esto se hace sólo aquí, para no afectar la performance del
+            % programa con datos que no se necesitan
+            %[NombreIneq, NombreEq] = this.escribe_nombre_restricciones();
+            
+            %cantidad_var_decision = length(this.vPuntosOperacion) * (length(this.pSEP.GeneradoresDespachables) + ...
+            %    length(this.pSEP.Subestaciones) + 3*length(this.pSEP.Lineas));
+
+            if nargin > 1
+                nombre_documento = varargin{1};
+            else
+                nombre_documento = [this.nombre_archivo_problema_opt '_' this.caso_estudio '_' num2str(this.iEtapa)];
+            end
+            docID = fopen(nombre_documento,'w');
+            fprintf(docID, 'Formulacion matemática OPF\n');
+            fprintf(docID, ['Tipo problema : ' this.pParOpt.entrega_tipo_problema()]);
+            fprintf(docID, ['\nFunción objetivo: ' this.pParOpt.entrega_funcion_objetivo()]);
+            fprintf(docID, ['\nTipo flujo de potencia: ' this.pParOpt.entrega_tipo_flujo()]);
+            fprintf(docID, ['\nTipo restricciones seguridad: ' this.pParOpt.entrega_tipo_restricciones_seguridad()]);
+            if this.pParOpt.entrega_flujo_dc_con_perdidas()
+            	val = 'si';
+            else
+            	val = 'no';
+            end
+                fprintf(docID, ['\nConsidera pérdidas: ' val]);
+            fprintf(docID, '\n');
+            
+            fprintf(docID, 'Funcion objetivo\n');
+            primero = true;
+            for i = 1:length(this.Fobj)
+                if this.Fobj(i) ~= 0
+                    val = round(this.Fobj(i),3);                    
+                    if primero
+                        text = strcat(num2str(val),'(',this.NombreVariables{i},')');
+                        primero = false;
+                    else
+                        if this.Fobj(i) > 0
+                            text = strcat(text, ' + ',num2str(val),'(', this.NombreVariables{i},')');
+                        else
+                            text = strcat(text, ' - ',num2str(abs(val)),'(',this.NombreVariables{i},')');
+                        end
+                        if length(text) > 170
+                            text = strcat(text,'\n');
+                            fprintf(docID, text);
+                            primero = true;
+                        end
+                    end
+                end
+            end
+            text = strcat(text,'\n');
+            fprintf(docID, text);
+            % restricciones
+            % restricciones de desigualdad
+            fprintf(docID, 'Restricciones de desigualdad:\n');
+
+            for i = 1:length(this.bineq)    
+                nombre_ineq = this.NombreIneq{i};
+                fprintf(docID, strcat(nombre_ineq,':\n'));
+                primero = true;
+                for j = 1:length(this.VarOpt)
+                    if this.Aineq(i,j) ~= 0
+                        val = this.Aineq(i,j);                    
+                        if primero
+                            if val == 1
+                                text = strcat('(',this.NombreVariables{j},')');
+                            elseif val == -1
+                                text = strcat('-', '(' ,this.NombreVariables{j}, ')');
+                            else
+                                text = strcat(num2str(val), '(', this.NombreVariables{j}, ')');
+                                %error = MException('cMILPOpt:imprime_problema_optimizacion','valor restriccion de desigualdad debe ser 1 o -1');
+                                %throw(error)
+                            end
+                            primero = false;
+                        else
+                            if val == 1
+                                text = strcat(text, ' + ', '(', this.NombreVariables{j}, ')');
+                            elseif val == -1
+                                text = strcat(text, ' - ', '(', this.NombreVariables{j}, ')');
+                            elseif val > 0
+                                text = strcat(text, ' + ', num2str(val), '(', this.NombreVariables{j}, ')');
+                            else
+                                text = strcat(text, ' - ', num2str(abs(val)), '(', this.NombreVariables{j}, ')');
+                                %error = MException('cMILPOpt:imprime_problema_optimizacion','valor restriccion de desigualdad debe ser 1 o -1');
+                                %throw(error)
+                            end
+                            if length(text) > 170
+                                text = strcat(text,'\n');
+                                fprintf(docID, text);
+                                primero = true;
+                            end
+                        end
+                    end
+                end
+                text = strcat(text,' <= ', num2str(this.bineq(i)),'\n\n');
+                fprintf(docID, text);
+            end
+
+            fprintf(docID, 'Restricciones de igualdad:\n');
+            for i = 1:length(this.beq)
+                nombre_eq = this.NombreEq{i};
+
+                fprintf(docID, strcat(nombre_eq,':\n'));
+                primero = true;
+                for j = 1:length(this.VarOpt)
+                    if this.Aeq(i,j) ~= 0
+                        val = this.Aeq(i,j);                    
+                        if primero
+                            if val == 1
+                                text = strcat('(',this.NombreVariables{j},')');
+                            elseif val == -1
+                                text = strcat('-','(',this.NombreVariables{j},')');
+                            elseif val > 0
+                                text = strcat(num2str(round(val,3)),'(',this.NombreVariables{j},')');
+                            else
+                                text = strcat('-', num2str(abs(round(val,3))),'(',this.NombreVariables{j},')');
+                            end
+                            primero = false;
+                        else
+                            if val == 1
+                                text = strcat(text, ' + ','(',this.NombreVariables{j},')');
+                            elseif val == -1
+                                text = strcat(text, ' - ','(',this.NombreVariables{j},')');
+                            elseif val > 0
+                                text = strcat(text, ' + ', num2str(round(val,3)),'(',this.NombreVariables{j},')');
+                            else
+                                text = strcat(text, ' - ', num2str(abs(round(val,3))),'(',this.NombreVariables{j},')');
+                            end
+                            if length(text) > 170
+                                text = strcat(text,'\n');
+                                fprintf(docID, text);
+                                primero = true;
+                            end
+                        end
+                    end
+                end
+                text = strcat(text,' = ', num2str(this.beq(i)),'\n\n');
+                fprintf(docID, text);
+            end
+            
+            % límites de las variables
+            fprintf(docID, 'Limites variables de decision:\n');
+            for i = 1:length(this.VarOpt)
+                text = strcat(num2str(this.lb(i)), ' <= ', this.NombreVariables{i}, ' <= ', num2str(this.ub(i)), '\n');
+                fprintf(docID, text);
+            end
+            fprintf(docID, 'fin');
+            fclose(docID);
+        end
+        
+        function inserta_varopt(this, vector, tipo_variable, unidades)
+            if ~isempty(vector)
+                pos = length(this.VarOpt);
+                this.VarOpt = [this.VarOpt; vector];
+                for i = 1:length(vector)
+                    vector(i).inserta_indice_varopt(pos + i);
+                    this.TipoVarOpt{end+1} = tipo_variable;
+                    this.UnidadesVarOpt{end+1} = unidades;
+                end
+            end
+        end
+
+        function agrega_varopt(this, variable, tipo_variable, unidades)
+            this.VarOpt = [this.VarOpt; variable];
+            id = length(this.VarOpt);
+            variable.inserta_indice_varopt(id);
+            this.TipoVarOpt{id} = tipo_variable;
+            this.UnidadesVarOpt{id} = unidades;
+        end
+        
+        function ingresa_nombres(this, indice_varopt, indice_global, oper, tipo_varopt, unidades_varopt)
+            switch tipo_varopt
+                case 'VariableControl'
+                    if strcmp(unidades_varopt, 'P')
+                        % Se trata de un generador
+                        id_bus = this.VarOpt(indice_varopt).entrega_bus().entrega_id_global();
+                        texto = strcat('P_G', num2str(this.VarOpt(indice_varopt).entrega_elemento_red().entrega_id()), ...
+                                       '_B', num2str(id_bus), '_O', num2str(oper));
+                        this.NombreVariables{indice_global} = texto;
+                    else
+                        error = MException('cOPF:ingresa_nombres',...
+                                           ['Inconsistencia en los datos. Tipo de variable unidad en variable de control '...
+                                             unidades_varopt ' no implementada']);
+                        throw(error)
+                    end
+                case 'VariableEstado'
+                    if strcmp(unidades_varopt, 'Theta')
+                        id_bus = this.VarOpt(indice_varopt).entrega_id_global();
+                        texto = strcat('Theta_B', num2str(id_bus), ...
+                                       '_O', num2str(oper));
+                        this.NombreVariables{indice_global} = texto;
+                    else
+                        error = MException('cOPF:ingresa_nombres',...
+                                           ['Inconsistencia en los datos. Tipo de variable unidad en variable de estado '...
+                                             unidades_varopt ' no implementada']);
+                        throw(error)
+                    end
+                case 'VariableAuxiliar'
+                    if strcmp(unidades_varopt, 'P')
+                        % Potencia activa en una línea o un trafo o consumo
+                        elred = this.VarOpt(indice_varopt).entrega_elemento_red();
+                        if isa(elred, 'cConsumo')
+                            id_consumo = elred.entrega_id();
+                            id_global_bus = this.VarOpt(indice_varopt).entrega_bus().entrega_id_global();
+                            texto = strcat('ENS_C', num2str(id_consumo), ...
+                                           '_B', num2str(id_global_bus), ...
+                                           '_O', num2str(oper));
+                            this.NombreVariables{indice_global} = texto;
+                        elseif isa(elred, 'cTransformador2D') || isa(elred, 'cLinea')
+                            id_par = elred.entrega_indice_paralelo();
+                            id_global_bus1 = this.VarOpt(indice_varopt).entrega_bus1().entrega_id_global();
+                            id_global_bus2 = this.VarOpt(indice_varopt).entrega_bus2().entrega_id_global();
+                            if isa(elred, 'cLinea')
+                                tipo_cond = elred.entrega_tipo_conductor();
+                            else
+                                tipo_cond = elred.entrega_tipo_trafo();
+                            end
+                            if isa(elred, 'cLinea')
+                                texto = strcat('P_L', num2str(id_par), ...
+                                               '_C', num2str(tipo_cond), ...
+                                               '_B', num2str(id_global_bus1), ...
+                                               '_', num2str(id_global_bus2), ...
+                                               '_O', num2str(oper));
+                                this.NombreVariables{indice_global} = texto;
+                            elseif isa(elred, 'cTransformador2D')
+                                texto = strcat('P_T', num2str(id_par), ...
+                                               '_Tipo', num2str(tipo_cond), ... 
+                                               '_B', num2str(id_global_bus1), ...
+                                               '_', num2str(id_global_bus2), ...
+                                               '_O', num2str(oper));
+                                this.NombreVariables{indice_global} = texto;
+                            end
+                        elseif isa(elred, 'cGenerador')
+                            % se trata de un generador ERNC
+                            id_bus = this.VarOpt(indice_varopt).entrega_bus().entrega_id_global();
+                            texto = strcat('PC_G', num2str(this.VarOpt(indice_varopt).entrega_elemento_red().entrega_id()), ...
+                                           '_B', num2str(id_bus), '_O', num2str(oper));
+                            this.NombreVariables{indice_global} = texto;                            
+                        else
+                        	error = MException('cOPF:ingresa_nombres',...
+                                               ['Inconsistencia en los datos. Tipo elemento de red ' ...
+                                               class(this.VarOpt(indice_varopt).entrega_elemento_red())...
+                                               ' no está implementado en variable auxiliar y tipo variable P']);
+                            throw(error)
+                        end
+                    elseif strcmp(unidades_varopt, 'Error_pos') || strcmp(unidades_varopt, 'Error_neg')
+                        % puede ser una línea, un trafo 
+                        id_par = this.VarOpt(indice_varopt).entrega_elemento_red().entrega_indice_paralelo();
+                        if isa(this.VarOpt(indice_varopt).entrega_elemento_red(), 'cLinea')
+                            id_global_bus1 = this.VarOpt(indice_varopt).entrega_bus1().entrega_elemento_red().entrega_id();
+                            id_global_bus2 = this.VarOpt(indice_varopt).entrega_bus2().entrega_elemento_red().entrega_id();
+                            tipo_cond = this.VarOpt(indice_varopt).entrega_elemento_red().entrega_tipo_conductor();
+                            texto = strcat(unidades_varopt, '_P_L', num2str(id_par), ...
+                                           '_C', num2str(tipo_cond), ...
+                                           '_B', num2str(id_global_bus1), ...
+                                           '_', num2str(id_global_bus2), ...
+                                           '_O', num2str(oper));
+                            this.NombreVariables{indice_global} = texto;
+                        elseif isa(this.VarOpt(indice_varopt).entrega_elemento_red(), 'cTransformador2D')
+                            id_global_bus1 = this.VarOpt(indice_varopt).entrega_bus1().entrega_elemento_red().entrega_id();
+                            id_global_bus2 = this.VarOpt(indice_varopt).entrega_bus2().entrega_elemento_red().entrega_id();
+                            texto = strcat(unidades_varopt, '_P_Tr', num2str(id_par), ...
+                                           '_B', num2str(id_global_bus1), ...
+                                           '_', num2str(id_global_bus2), ...
+                                           '_O', num2str(oper));
+                            this.NombreVariables{indice_global} = texto;
+                        else
+                            error = MException('cOPF:ingresa_nombres',...
+                                               ['Inconsistencia en los datos. Tipo elemento de red ' ...
+                                               class(this.VarOpt(indice_varopt).entrega_elemento_red())...
+                                               ' no está implementado en variable auxiliar y tipo variable Q']);
+                            throw(error)
+                        end
+                    else
+                        error = MException('cOPF:ingresa_nombres',...
+                                           ['Inconsistencia en los datos. Tipo de variable auxiliar con tipo de estado '...
+                                             unidades_varopt ' no implementada']);
+                        throw(error)
+                    end                        
+                otherwise
+                        error = MException('cOPF:ingresa_nombres',...
+                                           ['Inconsistencia en los datos. Tipo de variable '...
+                                             tipo_varopt ' no implementada']);
+                        throw(error)
+            end
+        end
+        
+        function copia_parametros_optimizacion(this, parametros)
+            this.pParOpt.FuncionObjetivo = parametros.FuncionObjetivo;
+            this.pParOpt.TipoFlujoPotencia = parametros.TipoFlujoPotencia;
+            this.pParOpt.TipoRestriccionesSeguridad = parametros.TipoRestriccionesSeguridad;
+            this.pParOpt.ConsideraDesprendimientoCarga = parametros.considera_desprendimiento_carga();
+            this.pParOpt.PenalizacionRecorteRES = parametros.PenalizacionRecorteRES;
+            
+            this.iNivelDebug = parametros.NivelDebugOPF;
+        end
+        
+        function ingresa_nombres_problema(this)
+            this.NombreVariables = cell(length(this.VarOpt)*length(this.vPuntosOperacion),1);
+            for oper = 1:length(this.vPuntosOperacion)
+                for i = 1:length(this.VarOpt)
+                    switch this.TipoVarOpt{i}
+                        case 'VariableControl'
+                            indice = this.VarOpt(i).entrega_varopt_operacion('P', oper);
+                        case 'VariableEstado'
+                            % ángulo de las subestaciones 
+                            indice = this.VarOpt(i).entrega_varopt_operacion('Theta', oper);
+                        case 'VariableAuxiliar'
+                            switch this.UnidadesVarOpt{i}
+                                case 'P'
+                                    % potencia activa de líneas y
+                                    % transformadores o energia no
+                                    % suministrada
+                                    indice = this.VarOpt(i).entrega_varopt_operacion('P', oper);
+                            end
+                    end
+                    this.ingresa_nombres(i,indice, oper, this.TipoVarOpt{i}, this.UnidadesVarOpt{i});
+                end
+            end
+            
+            this.NombreEq = cell(this.iIndiceEq,1);
+            pBuses = this.pSM.entrega_buses();
+            eserie = this.pSM.entrega_elementos_serie();
+            for oper = 1:length(this.vPuntosOperacion)
+                for i = 1:length(pBuses)
+                    id_restriccion_be = pBuses(i).entrega_indice_restriccion_balance_energia(oper);
+                    this.NombreEq{id_restriccion_be} = strcat('req_', num2str(id_restriccion_be), '_be_', 'B', num2str(pBuses(i).entrega_id_global()), '_O', num2str(oper));
+                end
+            
+                for i = 1:length(eserie)
+                    id_restriccion = eserie(i).entrega_indice_restriccion_flujos_angulos(oper);
+                    id_par = eserie(i).entrega_elemento_red().entrega_indice_paralelo();
+                    bus1 = eserie(i).entrega_bus1();
+                    bus2 = eserie(i).entrega_bus2();
+                    if isa(eserie(i).entrega_elemento_red(), 'cLinea')
+                        texto = 'L';
+                    else
+                        texto = 'Tr';
+                    end
+                	this.NombreEq{id_restriccion} = strcat('req_', num2str(id_restriccion), '_flujos_angulos', texto, num2str(id_par), ...
+                        '_B', num2str(bus1.entrega_id_global()), '_', num2str(bus2.entrega_id_global()), '_O', num2str(oper));
+                end
+            end     
+        end
+        
+        function elimina_nombres_problema(this)
+            this.NombreVariables = [];
+            this.NombreIneq = [];
+            this.NombreEq = [];
+        end
+        
+        function muestra_detalle_iteraciones(this,val)
+            this.MuestraDetalleIteraciones = val;
+        end
+        
+        function inserta_solver(this,val)
+            this.pParOpt.Solver = val;
+        end
+        
+ 	end
+end
